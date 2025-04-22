@@ -1,81 +1,139 @@
+import os
 import numpy as np
 import pandas as pd
 from scipy.sparse import csr_matrix, diags
 from sklearn.utils.extmath import randomized_svd
-from sklearn.model_selection import train_test_split
-from tqdm import tqdm
 import kagglehub
 
 
-def load_data(file_path):
-    """Load dataset and create user-item matrix"""
-    df = pd.read_csv(file_path)
-    # Convert user and item IDs to categorical indices
-    users = df['user_id'].astype('category').cat.codes.values
-    items = df['item_id'].astype('category').cat.codes.values
+def load_data(directory_path):
+    ratings_path = os.path.join(directory_path, 'ratings.dat')
+    df = pd.read_csv(
+        ratings_path, 
+        sep='::', 
+        engine='python',
+        names=['user_id', 'item_id', 'rating', 'timestamp'],
+        dtype={'user_id': int, 'item_id': int}
+    )
     
-    num_users = len(df['user_id'].unique())
-    num_items = len(df['item_id'].unique())
+    # create categorical mappings
+    user_ids = df['user_id'].unique()
+    item_ids = df['item_id'].unique()
+    user_map = {uid: idx for idx, uid in enumerate(user_ids)}
+    item_map = {iid: idx for idx, iid in enumerate(item_ids)}
     
-    # Create sparse interaction matrix
-    R = csr_matrix((np.ones(len(df)), (users, items)), 
-                    shape=(num_users, num_items))
-    return R, num_users, num_items
+    df['user_idx'] = df['user_id'].map(user_map)
+    df['item_idx'] = df['item_id'].map(item_map)
+    
+    return df, len(user_ids), len(item_ids)
 
+def temporal_split(df):
+    # temporal split using timestamps
+    df = df.sort_values(['user_id', 'timestamp'])
+    train, test = [], []
+    
+    for uid in df['user_id'].unique():
+        user_data = df[df['user_id'] == uid]
+        split_idx = int(0.8 * len(user_data))
+        train.append(user_data.iloc[:split_idx])
+        test.append(user_data.iloc[split_idx:])
+        
+    return pd.concat(train), pd.concat(test)
+
+def create_train_mask(train_data, num_users, num_items):
+    """Create boolean mask for training interactions"""
+    mask = np.zeros((num_users, num_items), dtype=bool)
+    for u, i in zip(train_data['user_idx'], train_data['item_idx']):
+        mask[u, i] = True
+    return mask
+    
 def preprocess(R):
-    """Normalize the interaction matrix"""
-    # Compute degree matrices
-    D_u = diags(1/np.sqrt(R.sum(axis=1).A.ravel()) 
-    D_i = diags(1/np.sqrt(R.sum(axis=0).A.ravel())
-    
-    # Normalize R
-    R_hat = D_u.dot(R).dot(D_i)
-    return R_hat
+    # normalized Laplacian with epsilon handling
+    user_degrees = np.array(R.sum(axis=1)).ravel()
+    item_degrees = np.array(R.sum(axis=0)).ravel()
 
-def svd_ae(R_hat, gamma=0.04):
-    """Compute truncated SVD and reconstruct matrix"""
+    user_degrees[user_degrees == 0] = 1e-6
+    item_degrees[item_degrees == 0] = 1e-6
+    
+    D_u = diags(1 / np.sqrt(user_degrees))
+    D_i = diags(1 / np.sqrt(item_degrees))
+
+    # normalize R
+    return D_u @ R @ D_i
+
+def svd_ae(R_hat, R_train, gamma):
+    # closed form soln from paper
     m = int(gamma * min(R_hat.shape))
     U, S, Vt = randomized_svd(R_hat, n_components=m, random_state=42)
-    S_diag = np.diag(S)
-    R_reconstructed = U @ S_diag @ Vt
-    return R_reconstructed
+    
+    # Paper's exact formulation
+    Sigma_inv = np.diag(1 / S)
+    Q_m = U
+    V_m = Vt.T
+    
+    B = V_m @ Sigma_inv @ Q_m.T @ R_train
+    return R_hat @ B
+    
+def evaluate(test_users, test_items, scores, train_mask, top_k=10):
+    hr_sum = 0
+    ndcg_sum = 0
+    user_counts = 0
 
-def evaluate(test_users, test_items, scores, top_k=10):
-    """Calculate HR@K and NDCG@K"""
-    hr = 0
-    ndcg = 0
-    for u in range(len(test_users)):
-        user_scores = scores[u]
-        # Mask already seen items
-        user_scores[test_users[u]] = -np.inf
-        # Get top-k predictions
+    test_df = pd.DataFrame({'user': test_users, 'item': test_items})
+    user_groups = test_df.groupby('user')['item'].apply(list)
+    
+    for user_idx, test_items in user_groups.items():
+        user_scores = scores[user_idx].copy()
+        
+        # mask training interactions
+        user_scores[train_mask[user_idx]] = -np.inf
+        
+        # top k prediction
         top_items = np.argpartition(user_scores, -top_k)[-top_k:]
-        # Check if test item is in top-k
-        if test_items[u] in top_items:
-            hr += 1
-            rank = np.where(top_items == test_items[u])[0][0]
-            ndcg += 1 / np.log2(rank + 2)
-    hr /= len(test_users)
-    ndcg /= len(test_users)
-    return hr, ndcg
+        top_items_set = set(top_items)
+        
+        hits = sum(1 for item in test_items if item in top_items_set)
+        if hits > 0:
+            hr_sum += 1
+
+            ranks = []
+            for item in test_items:
+                if item in top_items:
+                    ranks.append(np.where(top_items == item)[0][0] + 1)  # 1-based index
+            
+            dcg = sum(1 / np.log2(r + 1) for r in ranks)
+            idcg = sum(1 / np.log2(i + 1) for i in range(1, len(ranks)+1))
+            ndcg_sum += dcg / idcg
+            
+        user_counts += 1
+    
+    return hr_sum/user_counts, ndcg_sum/user_counts
 
 def main():
-    # Load and split data
-    dataset_path = kagglehub.dataset_download("odedgolden/movielens-1m-dataset")
-    R, num_users, num_items = load_data(dataset_path)
-    train_R, test_R = train_test_split(R, test_size=0.2, random_state=42)
+    df, num_users, num_items = load_data('/kaggle/input/movielens-1m-dataset')
+    train_data, test_data = temporal_split(df)
     
-    # Preprocess training data
-    R_hat = preprocess(train_R)
+    # create sparse matrices
+    R_train = csr_matrix(
+        (np.ones(len(train_data)), 
+         (train_data['user_idx'], train_data['item_idx'])),
+        shape=(num_users, num_items)
+    )
     
-    # Train SVD-AE
-    reconstructed = svd_ae(R_hat)
+    # preprocessing and training
+    R_hat = preprocess(R_train)
+    reconstructed = svd_ae(R_hat, R_train, gamma=0.3)
     
-    # Generate test pairs
-    test_users, test_items = test_R.nonzero()
+    train_mask = np.zeros((num_users, num_items), dtype=bool)
+    for u, i in zip(train_data['user_idx'], train_data['item_idx']):
+        train_mask[u, i] = True
     
-    # Evaluate
-    hr, ndcg = evaluate(test_users, test_items, reconstructed, top_k=10)
+    # test data preparation
+    test_users = test_data['user_idx'].values
+    test_items = test_data['item_idx'].values
+    
+    # evaluate
+    hr, ndcg = evaluate(test_users, test_items, reconstructed, train_mask)
     print(f"HR@10: {hr:.4f}, NDCG@10: {ndcg:.4f}")
 
 if __name__ == "__main__":
